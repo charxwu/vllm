@@ -1,0 +1,134 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1600" height="1040" viewBox="0 0 1600 1040" role="img" aria-labelledby="title desc">
+  <title id="title">vLLM UMBPStoreConnector shared three-mode architecture</title>
+  <desc id="desc">Existing vLLM runtime calls one shared UMBP connector whose runtime factory selects embedded, standalone, or distributed UMBP implementations.</desc>
+  <defs>
+    <marker id="arrow-gray" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="8" markerHeight="8" orient="auto-start-reverse">
+      <path d="M 0 0 L 10 5 L 0 10 z" fill="#475569"/>
+    </marker>
+    <marker id="arrow-purple" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="8" markerHeight="8" orient="auto-start-reverse">
+      <path d="M 0 0 L 10 5 L 0 10 z" fill="#7c3aed"/>
+    </marker>
+    <marker id="arrow-green" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="8" markerHeight="8" orient="auto-start-reverse">
+      <path d="M 0 0 L 10 5 L 0 10 z" fill="#047857"/>
+    </marker>
+    <filter id="shadow" x="-10%" y="-10%" width="120%" height="130%">
+      <feDropShadow dx="0" dy="3" stdDeviation="5" flood-color="#0f172a" flood-opacity="0.10"/>
+    </filter>
+    <style>
+      text { font-family: Inter, "Segoe UI", Arial, sans-serif; fill: #172033; }
+      .title { font-size: 31px; font-weight: 750; }
+      .subtitle { font-size: 16px; fill: #526079; }
+      .lane-title { font-size: 20px; font-weight: 750; }
+      .lane-note { font-size: 14px; font-weight: 600; }
+      .box-title { font-size: 17px; font-weight: 700; }
+      .body { font-size: 14px; fill: #394861; }
+      .small { font-size: 12.5px; fill: #526079; }
+      .badge { font-size: 12px; font-weight: 750; }
+      .boundary { font-size: 14px; font-weight: 750; fill: #6d28d9; letter-spacing: 0.3px; }
+    </style>
+  </defs>
+
+  <rect width="1600" height="1040" fill="#f8fafc"/>
+  <text x="800" y="45" text-anchor="middle" class="title">UMBPStoreConnector for vLLM</text>
+  <text x="800" y="73" text-anchor="middle" class="subtitle">One connector framework shared by embedded, standalone, and distributed UMBP modes</text>
+
+  <!-- Existing vLLM -->
+  <rect x="42" y="100" width="1516" height="164" rx="20" fill="#f1f5f9" stroke="#94a3b8" stroke-width="2"/>
+  <rect x="42" y="100" width="1516" height="42" rx="20" fill="#e2e8f0"/>
+  <rect x="42" y="122" width="1516" height="20" fill="#e2e8f0"/>
+  <text x="68" y="129" class="lane-title" fill="#334155">A | Existing vLLM Runtime</text>
+  <text x="1532" y="129" text-anchor="end" class="lane-note" fill="#475569">no UMBP mode-specific changes</text>
+
+  <rect x="90" y="162" width="390" height="72" rx="13" fill="#ffffff" stroke="#94a3b8" stroke-width="1.8" filter="url(#shadow)"/>
+  <text x="285" y="191" text-anchor="middle" class="box-title">Scheduler / Block Manager</text>
+  <text x="285" y="216" text-anchor="middle" class="body">prefix | allocation | preemption</text>
+
+  <rect x="605" y="162" width="390" height="72" rx="13" fill="#ffffff" stroke="#64748b" stroke-width="1.8"/>
+  <text x="800" y="191" text-anchor="middle" class="box-title">KVConnectorBase_V1 Hooks</text>
+  <text x="800" y="216" text-anchor="middle" class="body">scheduler metadata and worker lifecycle</text>
+
+  <rect x="1120" y="162" width="390" height="72" rx="13" fill="#ffffff" stroke="#94a3b8" stroke-width="1.8" filter="url(#shadow)"/>
+  <text x="1315" y="191" text-anchor="middle" class="box-title">Worker / Model Runner</text>
+  <text x="1315" y="216" text-anchor="middle" class="body">KV tensors | execution | GPU blocks</text>
+
+  <line x1="480" y1="198" x2="605" y2="198" stroke="#64748b" stroke-width="2.5" marker-end="url(#arrow-gray)"/>
+  <line x1="1120" y1="198" x2="995" y2="198" stroke="#64748b" stroke-width="2.5" marker-end="url(#arrow-gray)"/>
+
+  <!-- Shared connector -->
+  <rect x="42" y="290" width="1516" height="350" rx="20" fill="#f5f3ff" stroke="#8b5cf6" stroke-width="2.5"/>
+  <rect x="42" y="290" width="1516" height="44" rx="20" fill="#ede9fe"/>
+  <rect x="42" y="312" width="1516" height="22" fill="#ede9fe"/>
+  <text x="68" y="319" class="lane-title" fill="#6d28d9">B | New UMBP Connector Code</text>
+  <text x="1532" y="319" text-anchor="end" class="lane-note" fill="#6d28d9">implemented once and shared by all UMBP modes</text>
+
+  <rect x="84" y="365" width="340" height="116" rx="14" fill="#ffffff" stroke="#8b5cf6" stroke-width="2" filter="url(#shadow)"/>
+  <text x="254" y="397" text-anchor="middle" class="box-title">UMBPStoreConnectorScheduler</text>
+  <text x="254" y="426" text-anchor="middle" class="body">prefix lookup orchestration</text>
+  <text x="254" y="451" text-anchor="middle" class="body">allocation and metadata planning</text>
+
+  <rect x="468" y="365" width="664" height="116" rx="14" fill="#ffffff" stroke="#7c3aed" stroke-width="2.2" filter="url(#shadow)"/>
+  <text x="800" y="397" text-anchor="middle" class="box-title">Shared UMBP Connector Core</text>
+  <text x="800" y="426" text-anchor="middle" class="body">Replication-aware identity | KVLayoutPlanner | UMBPConnectorMetadata</text>
+  <text x="800" y="451" text-anchor="middle" class="body">TransferJobState | layer pipeline | pinning | failure-to-recompute</text>
+
+  <rect x="1176" y="365" width="340" height="116" rx="14" fill="#ffffff" stroke="#8b5cf6" stroke-width="2" filter="url(#shadow)"/>
+  <text x="1346" y="397" text-anchor="middle" class="box-title">UMBPStoreConnectorWorker</text>
+  <text x="1346" y="426" text-anchor="middle" class="body">register GPU KV buffers once</text>
+  <text x="1346" y="451" text-anchor="middle" class="body">group ranges and wait per layer</text>
+
+  <rect x="360" y="526" width="880" height="78" rx="14" fill="#ddd6fe" stroke="#7c3aed" stroke-width="2.4"/>
+  <text x="800" y="557" text-anchor="middle" class="box-title">UMBPRuntimeFactory + IUMBPRuntime</text>
+  <text x="800" y="583" text-anchor="middle" class="body">BatchLookup | RegisterGPU | LoadGroup | WaitLayer | StoreBatch | Publish | Close</text>
+
+  <line x1="800" y1="234" x2="800" y2="365" stroke="#7c3aed" stroke-width="3" marker-end="url(#arrow-purple)"/>
+  <line x1="424" y1="423" x2="468" y2="423" stroke="#7c3aed" stroke-width="2.5" marker-end="url(#arrow-purple)"/>
+  <line x1="1176" y1="423" x2="1132" y2="423" stroke="#7c3aed" stroke-width="2.5" marker-end="url(#arrow-purple)"/>
+  <line x1="800" y1="481" x2="800" y2="526" stroke="#7c3aed" stroke-width="2.5" marker-end="url(#arrow-purple)"/>
+
+  <!-- Runtime seam -->
+  <line x1="72" y1="670" x2="1528" y2="670" stroke="#7c3aed" stroke-width="3" stroke-dasharray="11 8"/>
+  <rect x="580" y="649" width="440" height="42" rx="21" fill="#ffffff" stroke="#7c3aed" stroke-width="2"/>
+  <text x="800" y="676" text-anchor="middle" class="boundary">STABLE UMBP RUNTIME BOUNDARY</text>
+  <text x="78" y="700" class="small">Above: shared vLLM-facing connector semantics</text>
+  <text x="1522" y="700" text-anchor="end" class="small">Below: UMBP mode-specific implementation</text>
+
+  <!-- Mode runtimes -->
+  <rect x="42" y="716" width="1516" height="276" rx="20" fill="#ecfdf5" stroke="#10b981" stroke-width="2.5"/>
+  <rect x="42" y="716" width="1516" height="44" rx="20" fill="#d1fae5"/>
+  <rect x="42" y="738" width="1516" height="22" fill="#d1fae5"/>
+  <text x="68" y="745" class="lane-title" fill="#047857">C | UMBP Runtime Code and Services</text>
+  <text x="1532" y="745" text-anchor="end" class="lane-note" fill="#047857">mode-specific lookup, transport, publication, and lifecycle</text>
+
+  <rect x="74" y="786" width="456" height="166" rx="15" fill="#ffffff" stroke="#059669" stroke-width="2.2" filter="url(#shadow)"/>
+  <text x="302" y="818" text-anchor="middle" class="box-title">EmbeddedRuntime</text>
+  <text x="302" y="847" text-anchor="middle" class="body">worker lookup IPC | local ranged copy</text>
+  <rect x="112" y="869" width="380" height="50" rx="10" fill="#dcfce7" stroke="#22c55e"/>
+  <text x="302" y="891" text-anchor="middle" class="body">masterless private UMBP client</text>
+  <text x="302" y="911" text-anchor="middle" class="small">immediate local visibility</text>
+  <rect x="212" y="929" width="180" height="20" rx="10" fill="#d1fae5"/>
+  <text x="302" y="944" text-anchor="middle" class="badge" fill="#047857">UMBP RUNTIME</text>
+
+  <rect x="572" y="786" width="456" height="166" rx="15" fill="#ffffff" stroke="#059669" stroke-width="2.2" filter="url(#shadow)"/>
+  <text x="800" y="818" text-anchor="middle" class="box-title">StandaloneRuntime</text>
+  <text x="800" y="847" text-anchor="middle" class="body">local-service lookup | local IPC transfer</text>
+  <rect x="610" y="869" width="380" height="50" rx="10" fill="#dcfce7" stroke="#22c55e"/>
+  <text x="800" y="891" text-anchor="middle" class="body">node-local UMBP service</text>
+  <text x="800" y="911" text-anchor="middle" class="small">shared same-host pool and visibility</text>
+  <rect x="710" y="929" width="180" height="20" rx="10" fill="#d1fae5"/>
+  <text x="800" y="944" text-anchor="middle" class="badge" fill="#047857">UMBP RUNTIME</text>
+
+  <rect x="1070" y="786" width="456" height="166" rx="15" fill="#ffffff" stroke="#059669" stroke-width="2.2" filter="url(#shadow)"/>
+  <text x="1298" y="818" text-anchor="middle" class="box-title">DistributedRuntime</text>
+  <text x="1298" y="847" text-anchor="middle" class="body">master lookup | peer routing | MORI-IO</text>
+  <rect x="1108" y="869" width="380" height="50" rx="10" fill="#dcfce7" stroke="#22c55e"/>
+  <text x="1298" y="891" text-anchor="middle" class="body">UMBP Master + Peers + HBM/DRAM/SSD</text>
+  <text x="1298" y="911" text-anchor="middle" class="small">heartbeat-acknowledged global visibility</text>
+  <rect x="1208" y="929" width="180" height="20" rx="10" fill="#d1fae5"/>
+  <text x="1298" y="944" text-anchor="middle" class="badge" fill="#047857">UMBP RUNTIME</text>
+
+  <path d="M800 604 V670 H302 V786" fill="none" stroke="#047857" stroke-width="3" marker-end="url(#arrow-green)"/>
+  <path d="M800 604 V786" fill="none" stroke="#047857" stroke-width="3" marker-end="url(#arrow-green)"/>
+  <path d="M800 604 V670 H1298 V786" fill="none" stroke="#047857" stroke-width="3" marker-end="url(#arrow-green)"/>
+
+  <text x="800" y="1022" text-anchor="middle" class="small">Mode is selected at connector initialization; the shared connector code and metadata remain unchanged.</text>
+</svg>
