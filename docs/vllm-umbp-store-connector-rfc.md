@@ -241,6 +241,10 @@ Questions to resolve:
 
 The proposed feedback period is at least one week after this RFC is posted to the vLLM community. The architecture and first PR boundary should be agreed before implementation begins; mode-specific details can continue to evolve in their corresponding PRs.
 
+## CC List
+
+@hongxiayang @tjtanaa @vllmellm @TianDi101
+
 ## Any Other Things
 
 ### References
