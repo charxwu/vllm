@@ -3,6 +3,8 @@
 
 import sys
 import threading
+import time
+from concurrent.futures import Future
 from dataclasses import replace
 from types import SimpleNamespace
 
@@ -21,12 +23,14 @@ from vllm.distributed.kv_transfer.kv_connector.v1.umbp.connector import (
 )
 from vllm.distributed.kv_transfer.kv_connector.v1.umbp.data import (
     BlockIdentityCodec,
+    BlockLoadBatch,
     BlockTransferPlan,
     KVLayoutDescriptor,
     KVLayoutPlanner,
     KVRange,
     KVRegion,
     RankTopology,
+    TransferJobState,
     TransferJobStatus,
     UMBPConnectorMetadata,
     UMBPNamespace,
@@ -42,6 +46,9 @@ from vllm.distributed.kv_transfer.kv_connector.v1.umbp.runtime.embedded import (
     _MoriSchedulerHandle,
     _MoriWorkerHandle,
     _rank_namespace_from_key_prefix,
+)
+from vllm.distributed.kv_transfer.kv_connector.v1.umbp.worker import (
+    UMBPStoreConnectorWorker,
 )
 
 
@@ -97,6 +104,156 @@ def test_mori_range_arguments_preserve_sparse_offsets_and_empty_objects(for_stor
         [[], [16, 8]],
         [[], [48, 0]],
     )
+
+
+@pytest.fixture
+def bulk_worker(monkeypatch, tmp_path):
+    calls: list[
+        tuple[list[str], list[int], list[list[int]], list[list[int]], list[list[int]]]
+    ] = []
+
+    def get(keys, pointers, sizes, offsets):
+        calls.append((keys, [], pointers, sizes, offsets))
+        return [key != "missing" for key in keys]
+
+    def put(keys, object_sizes, pointers, sizes, offsets):
+        calls.append((keys, object_sizes, pointers, sizes, offsets))
+        return [True] * len(keys)
+
+    monkeypatch.setitem(
+        sys.modules,
+        "mori.cpp",
+        SimpleNamespace(MemoryLocationType=SimpleNamespace(CPU=0, GPU=1)),
+    )
+    client = SimpleNamespace(
+        register_memory=lambda *a: True,
+        deregister_memory=lambda *a: True,
+        batch_get_ranges_into_ptr=get,
+        batch_put_ranges_from_ptr=put,
+        flush=lambda: True,
+        close=lambda: None,
+    )
+    planner = KVLayoutPlanner(
+        [
+            KVRegion("a", 0, 64, 32, 0, 16),
+            KVRegion("b", 1, 32, 16, 32, 16),
+            KVRegion("c", 0, 128, 64, 48, 16),
+        ]
+    )
+    handle = _MoriWorkerHandle(
+        client,
+        "bulk",
+        RankTopology(),
+        str(tmp_path),
+        1,
+        5,
+        planner.describe(RankTopology()),
+    )
+    worker = UMBPStoreConnectorWorker(handle, planner)
+    buffers = {
+        r.layer_name: torch.empty((8, r.block_stride), dtype=torch.uint8)
+        for r in planner.regions
+    }
+    worker.register_kv_caches(buffers)
+    yield worker, buffers, calls
+    handle.close()
+
+
+@pytest.mark.parametrize("batched", [False, True])
+def test_bulk_load_preserves_group_order_failures_and_new_buffers(
+    bulk_worker, batched, monkeypatch
+):
+    worker, buffers, calls = bulk_worker
+    plans = [
+        BlockTransferPlan("group1", 3, group_id=1, request_id="r"),
+        BlockTransferPlan("missing", 4, group_id=0, request_id="r"),
+        BlockTransferPlan("group0", 6, group_id=0, request_id="r"),
+    ]
+    for caches in (buffers, {name: torch.empty_like(t) for name, t in buffers.items()}):
+        worker.register_kv_caches(caches)
+        expected = _MoriWorkerHandle._range_args(
+            [worker.layout.materialize(p) for p in plans], for_store=False
+        )
+        supplied = plans
+        if batched:
+            supplied = BlockLoadBatch(
+                [p.key for p in plans],
+                [p.block_id for p in plans],
+                [p.group_id for p in plans],
+                "r",
+            )
+            monkeypatch.setattr(
+                BlockLoadBatch,
+                "__getitem__",
+                lambda *a: pytest.fail(
+                    "bulk loading must not materialize per-block plans"
+                ),
+            )
+        job = worker.runtime.load_blocks(supplied)
+        assert job is not None
+        result = worker.runtime.wait(job)
+        assert calls[-1] == expected
+        assert result.plans is supplied if batched else result.plans == tuple(plans)
+        assert result.failed_block_ids == {4}
+        assert result.completed_keys == {"group0", "group1"}
+        assert result.completed_bytes == 112
+    assert len(calls) == 2
+    assert calls[0][2] != calls[1][2]
+
+
+def test_bulk_store_matches_materialized_ranges(bulk_worker, monkeypatch):
+    worker, _, calls = bulk_worker
+    plans = [
+        BlockTransferPlan("group1", 3, group_id=1, request_id="r"),
+        BlockTransferPlan("group0", 6, group_id=0, request_id="r"),
+    ]
+    expected = _MoriWorkerHandle._range_args(
+        [worker.layout.materialize(p) for p in plans]
+    )
+    monkeypatch.setattr(
+        worker.layout,
+        "materialize",
+        lambda *a: pytest.fail("bulk stores must not materialize per-block plans"),
+    )
+
+    worker.enqueue_stores(UMBPConnectorMetadata(store_requests={"r": plans}))
+    (job,) = worker._store_jobs.values()
+    result = worker.runtime.wait(job)
+
+    assert calls == [expected]
+    assert result.plans == tuple(plans)
+    assert result.completed_keys == {"group0", "group1"}
+    assert result.completed_bytes == 112
+
+
+@pytest.mark.parametrize("special", ["subblocks", "materialized", "batch-subblocks"])
+def test_bulk_load_falls_back_for_entire_mixed_batch(bulk_worker, special):
+    worker, buffers, calls = bulk_worker
+    plans = [
+        BlockTransferPlan("a", 1, group_id=1),
+        BlockTransferPlan("c", 2, group_id=0),
+    ]
+    if special in ("subblocks", "batch-subblocks"):
+        buffers["c"] = torch.empty((16, 32), dtype=torch.uint8)
+        worker.register_kv_caches(buffers)
+        if special == "batch-subblocks":
+            plans = BlockLoadBatch(
+                [p.key for p in plans],
+                [p.block_id for p in plans],
+                [p.group_id for p in plans],
+                "r",
+            )
+    else:
+        plans[1] = worker.layout.materialize(plans[1])
+    assert worker.runtime.load_blocks(plans) is None
+    assert not calls
+    expected = _MoriWorkerHandle._range_args(
+        [p if p.ranges else worker.layout.materialize(p) for p in plans],
+        for_store=False,
+    )
+    worker.start_load_kv(None, UMBPConnectorMetadata(load_requests={"r": plans}))
+    worker.wait_for_layer_load("")
+    assert calls == [expected]
 
 
 def test_embedded_runtime_maps_dram_options_to_mori_config():
@@ -546,8 +703,43 @@ def test_embedded_scheduler_clear_removes_published_objects():
     scheduler.close()
 
 
+def test_mori_worker_reports_published_key_eviction(tmp_path):
+    class _Client:
+        def flush(self):
+            return True
+
+        def batch_exists(self, keys):
+            return [False] * len(keys)
+
+        def close(self):
+            pass
+
+    handle = _MoriWorkerHandle(
+        _Client(),
+        "eviction",
+        RankTopology(),
+        str(tmp_path),
+        1,
+        1,
+    )
+    plan = BlockTransferPlan("evicted-key", 0)
+    job = TransferJobState((plan,))
+    job.start()
+    job.complete()
+    handle.publish(job)
+
+    assert handle.batch_exists(["evicted-key"]) == [False]
+    assert handle.take_evicted_keys() == ("evicted-key",)
+    assert handle.take_evicted_keys() == ()
+    handle.close()
+
+
+@pytest.mark.parametrize("operation", ["wait", "cancel"])
+@pytest.mark.parametrize("timeout_first", [False, True])
 @pytest.mark.parametrize("blocked_stage", ["copy", "flush", "load"])
-def test_mori_transfer_keeps_buffers_owned_until_completion(tmp_path, blocked_stage):
+def test_mori_transfer_keeps_buffers_owned_until_completion(
+    monkeypatch, tmp_path, operation, timeout_first, blocked_stage
+):
     class _Client:
         def __init__(self):
             self.started = threading.Event()
@@ -587,29 +779,62 @@ def test_mori_transfer_keeps_buffers_owned_until_completion(tmp_path, blocked_st
         def close(self):
             pass
 
+    monkeypatch.setitem(
+        sys.modules,
+        "mori.cpp",
+        SimpleNamespace(MemoryLocationType=SimpleNamespace(CPU=0, GPU=1)),
+    )
     client = _Client()
     source = torch.zeros((1, 1024), dtype=torch.uint8)
     handle = _MoriWorkerHandle(
         client,
-        "owned-buffer",
+        "cancel-reuse",
         RankTopology(),
         str(tmp_path),
         1,
+        5,
+        KVLayoutDescriptor((KVRegion("layer0", 0, 1024, 1024, 0),), RankTopology()),
     )
     handle.register_buffers({"layer0": source})
-    size = source.numel()
-    plan = BlockTransferPlan(
-        "owned-buffer-key",
-        0,
-        ranges=(KVRange("layer0", 0, 0, source.data_ptr(), size, size, 0),),
+    job = (
+        handle.load_blocks([BlockTransferPlan("cancel-reuse-key", 0, group_id=0)])
+        if blocked_stage == "load"
+        else handle.store(
+            [
+                BlockTransferPlan(
+                    "cancel-reuse-key",
+                    0,
+                    ranges=(
+                        KVRange(
+                            "layer0",
+                            0,
+                            0,
+                            source.data_ptr(),
+                            source.numel(),
+                            source.numel(),
+                            0,
+                        ),
+                    ),
+                )
+            ]
+        )
     )
-    job = handle.load([plan]) if blocked_stage == "load" else handle.store([plan])
+    assert job is not None
     assert client.started.wait(5)
     assert handle.poll(job) is None
-    assert handle.batch_exists(["owned-buffer-key"]) == [False]
+    assert handle.batch_exists(["cancel-reuse-key"]) == [False]
     result = []
-    waiter = threading.Thread(target=lambda: result.append(handle.wait(job)))
+    waiter = threading.Thread(
+        target=lambda: result.append(getattr(handle, operation)(job))
+    )
     try:
+        if timeout_first:
+            handle._timeout_s = 0.001
+            with pytest.raises(TimeoutError, match="buffers still in use"):
+                getattr(handle, operation)(job)
+            assert job.status is TransferJobStatus.RUNNING
+            assert handle.poll(job) is None
+        handle._timeout_s = 5
         waiter.start()
         waiter.join(0.1)
         assert waiter.is_alive()
@@ -637,7 +862,7 @@ def test_mori_publication_does_not_flush_on_the_worker_thread(tmp_path, flush_su
         flush=flush,
         close=lambda: None,
     )
-    handle = _MoriWorkerHandle(client, "flush", RankTopology(), str(tmp_path), 1)
+    handle = _MoriWorkerHandle(client, "flush", RankTopology(), str(tmp_path), 1, 5)
     try:
         job = handle.wait(handle.store([BlockTransferPlan("key", 0)]))
         assert len(flush_threads) == 1
@@ -651,3 +876,66 @@ def test_mori_publication_does_not_flush_on_the_worker_thread(tmp_path, flush_su
         assert len(flush_threads) == 1
     finally:
         handle.close()
+
+
+def test_store_timeout_does_not_count_time_waiting_for_a_worker(tmp_path):
+    release = threading.Event()
+
+    def put(keys, *args):
+        release.wait(5)
+        return [True] * len(keys)
+
+    client = SimpleNamespace(
+        batch_put_ranges_from_ptr=put,
+        batch_exists=lambda keys: [True] * len(keys),
+        flush=lambda: True,
+        close=lambda: None,
+    )
+    handle = _MoriWorkerHandle(client, "queued", RankTopology(), str(tmp_path), 1, 5)
+    try:
+        running = handle.store([BlockTransferPlan("running", 0)])
+        handle._timeout_s = 0.05
+        queued = handle.store([BlockTransferPlan("queued", 0)])
+        time.sleep(0.2)
+        # Still behind the running store on the only transfer thread.
+        assert handle.poll(queued) is None
+        handle._timeout_s = 5
+        release.set()
+        assert handle.wait(running).status is TransferJobStatus.COMPLETED
+        assert handle.wait(queued).status is TransferJobStatus.COMPLETED
+    finally:
+        release.set()
+        handle.close()
+
+
+def test_async_store_timeout_does_not_release_buffers():
+    handle = _MoriWorkerHandle(
+        SimpleNamespace(close=lambda: None), "timeout", RankTopology(), "/tmp", 1, 1
+    )
+    job = TransferJobState((BlockTransferPlan("pending", 0),))
+    job.start()
+    future: Future[TransferJobState] = Future()
+    handle._futures[id(job)] = future
+    handle._store_deadlines[id(job)] = 0
+    with pytest.raises(TimeoutError, match="buffers still in use"):
+        handle.poll(job)
+    assert job.status is TransferJobStatus.RUNNING
+    assert handle._futures[id(job)] is future
+    job.complete()
+    future.set_result(job)
+    assert handle.poll(job) is job
+    handle.close()
+
+
+def test_mori_completed_transfer_timeout_is_a_safe_failure():
+    handle = _MoriWorkerHandle(
+        SimpleNamespace(close=lambda: None), "timeout", RankTopology(), "/tmp", 1, 1
+    )
+    job = TransferJobState((BlockTransferPlan("failed", 0),))
+    job.start()
+    future: Future[TransferJobState] = Future()
+    future.set_exception(TimeoutError("backend already stopped"))
+    handle._futures[id(job)] = future
+    assert handle.wait(job).status is TransferJobStatus.FAILED
+    assert handle.poll(job) is job
+    handle.close()

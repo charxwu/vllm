@@ -155,6 +155,7 @@ def test_mori_store_overlaps_gpu_compute(tmp_path):
                 "capacity_bytes": 256 << 20,
                 "lookup_dir": str(tmp_path),
                 "num_workers": 2,
+                "timeout_ms": 60000,
             },
         )
     )
@@ -210,7 +211,8 @@ def test_mori_store_overlaps_gpu_compute(tmp_path):
     not torch.accelerator.is_available(),
     reason="requires a ROCm GPU",
 )
-def test_mori_embedded_dram_eviction_and_restore(tmp_path):
+@pytest.mark.parametrize("bulk_load", [False, True])
+def test_mori_embedded_dram_eviction_and_restore(tmp_path, bulk_load):
     torch.accelerator.set_device_index(0)
     object_size = 1 << 20
     topology = RankTopology()
@@ -226,6 +228,7 @@ def test_mori_embedded_dram_eviction_and_restore(tmp_path):
                 "dram_high_watermark": 0.75,
                 "dram_low_watermark": 0.5,
                 "lookup_dir": str(tmp_path),
+                "timeout_ms": 60000,
             },
         )
     )
@@ -264,30 +267,37 @@ def test_mori_embedded_dram_eviction_and_restore(tmp_path):
     missing = {key for key, hit in zip(keys, hits, strict=True) if not hit}
     assert missing
     assert hits[-1]
+    assert missing <= set(worker.take_evicted_keys())
 
     destination.zero_()
     latest = keys[-1]
-    job = worker.load(
-        [
-            BlockTransferPlan(
-                latest,
-                len(keys) - 1,
-                ranges=(
-                    KVRange(
-                        "layer0",
-                        0,
-                        len(keys) - 1,
-                        destination.data_ptr(),
-                        object_size,
-                        object_size,
-                        0,
+    if bulk_load:
+        worker.register_buffers({"layer0": destination})
+        job = worker.load_blocks([BlockTransferPlan(latest, 0, group_id=0)])
+        assert job is not None
+    else:
+        job = worker.load(
+            [
+                BlockTransferPlan(
+                    latest,
+                    len(keys) - 1,
+                    ranges=(
+                        KVRange(
+                            "layer0",
+                            0,
+                            len(keys) - 1,
+                            destination.data_ptr(),
+                            object_size,
+                            object_size,
+                            0,
+                        ),
                     ),
-                ),
-            )
-        ]
-    )
+                )
+            ]
+        )
     loaded = worker.wait(job)
     assert loaded.status is TransferJobStatus.COMPLETED
+    assert loaded.completed_bytes == object_size
     torch.accelerator.synchronize()
     assert torch.all(destination == expected[latest])
     worker.close()
