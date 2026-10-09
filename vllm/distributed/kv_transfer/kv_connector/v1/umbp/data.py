@@ -14,7 +14,7 @@ import json
 from collections.abc import Sequence
 from dataclasses import dataclass, field, replace
 from enum import Enum
-from typing import Any, NamedTuple
+from typing import Any, NamedTuple, overload
 
 import torch
 
@@ -478,6 +478,48 @@ class BlockTransferPlan:
     ranges: tuple[KVRange, ...] = ()
     request_id: str | None = None
     group_id: int | None = None
+    block_hash: bytes | None = None
+    parent_block_hash: bytes | None = None
+    token_ids: tuple[int, ...] = ()
+    block_size: int = 0
+    medium: str = "CPU"
+
+
+@dataclass(frozen=True)
+class BlockLoadBatch(Sequence[BlockTransferPlan]):
+    """Whole-block loads with request metadata shared across the batch."""
+
+    keys: list[str]
+    block_ids: list[int]
+    group_ids: list[int]
+    request_id: str
+
+    def __post_init__(self) -> None:
+        if len(self.keys) != len(self.block_ids) or len(self.keys) != len(
+            self.group_ids
+        ):
+            raise ValueError("load batch columns must have equal lengths")
+
+    def __len__(self) -> int:
+        return len(self.keys)
+
+    @overload
+    def __getitem__(self, index: int) -> BlockTransferPlan: ...
+
+    @overload
+    def __getitem__(self, index: slice) -> list[BlockTransferPlan]: ...
+
+    def __getitem__(
+        self, index: int | slice
+    ) -> BlockTransferPlan | list[BlockTransferPlan]:
+        if isinstance(index, slice):
+            return [self[i] for i in range(*index.indices(len(self)))]
+        return BlockTransferPlan(
+            key=self.keys[index],
+            block_id=self.block_ids[index],
+            group_id=self.group_ids[index],
+            request_id=self.request_id,
+        )
 
 
 @dataclass
@@ -486,6 +528,7 @@ class LoadSpec:
 
     local_tokens: int
     external_tokens: int
+    block_hashes_by_group: tuple[tuple[bytes | None, ...], ...] = ()
 
     @property
     def num_tokens_to_load(self) -> int:
@@ -538,21 +581,40 @@ class TransferJobStatus(str, Enum):
     RUNNING = "running"
     COMPLETED = "completed"
     FAILED = "failed"
+    CANCELLED = "cancelled"
 
 
 @dataclass
 class TransferJobState:
     """Per-key completion state; one failed key does not fail its siblings."""
 
-    plans: tuple[BlockTransferPlan, ...]
+    plans: tuple[BlockTransferPlan, ...] | BlockLoadBatch
     status: TransferJobStatus = TransferJobStatus.PENDING
     completed_keys: set[str] = field(default_factory=set)
     failed_keys: set[str] = field(default_factory=set)
     error: str | None = None
+    plan_bytes: tuple[int, ...] | None = None
 
     @property
     def keys(self) -> Sequence[str]:
+        if isinstance(self.plans, BlockLoadBatch):
+            return self.plans.keys
         return tuple(plan.key for plan in self.plans)
+
+    @property
+    def completed_bytes(self) -> int:
+        if self.plan_bytes is not None:
+            return sum(
+                size
+                for key, size in zip(self.keys, self.plan_bytes, strict=True)
+                if key in self.completed_keys
+            )
+        return sum(
+            item.length
+            for plan in self.plans
+            if plan.key in self.completed_keys
+            for item in plan.ranges
+        )
 
     def start(self) -> None:
         if self.status != TransferJobStatus.PENDING:
@@ -568,8 +630,20 @@ class TransferJobState:
         self.error = error
         self._finish_if_done()
 
+    def cancel(self, error: str = "cancelled") -> None:
+        self.error = error
+        self.status = TransferJobStatus.CANCELLED
+
     @property
     def failed_block_ids(self) -> set[int]:
+        if isinstance(self.plans, BlockLoadBatch):
+            return {
+                block_id
+                for key, block_id in zip(
+                    self.plans.keys, self.plans.block_ids, strict=True
+                )
+                if key in self.failed_keys
+            }
         return {plan.block_id for plan in self.plans if plan.key in self.failed_keys}
 
     def _finish_if_done(self) -> None:
@@ -588,7 +662,9 @@ class UMBPConnectorMetadata(KVConnectorMetadata):
 
     async_load: bool = False
     store_plans: list[BlockTransferPlan] = field(default_factory=list)
-    load_requests: dict[str, list[BlockTransferPlan]] = field(default_factory=dict)
+    load_requests: dict[str, list[BlockTransferPlan] | BlockLoadBatch] = field(
+        default_factory=dict
+    )
     store_requests: dict[str, list[BlockTransferPlan]] = field(default_factory=dict)
     preempted_request_ids: set[str] = field(default_factory=set)
     store_event: int = -1
@@ -599,9 +675,11 @@ class StoreEventResult:
     """Number of workers that finished one store event."""
 
     completed_workers: int = 0
+    failed_objects: set[tuple[int, bytes]] = field(default_factory=set)
 
     def merge(self, other: StoreEventResult) -> None:
         self.completed_workers += other.completed_workers
+        self.failed_objects.update(other.failed_objects)
 
 
 @dataclass

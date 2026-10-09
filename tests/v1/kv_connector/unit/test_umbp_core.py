@@ -8,6 +8,7 @@ import pytest
 import torch
 
 from tests.v1.kv_connector.umbp_test_utils import (
+    _CancellableWorkerHandle,
     _DelayedLoadWorkerHandle,
     _DelayedStoreWorkerHandle,
     _EmbeddedRuntime,
@@ -25,6 +26,7 @@ from vllm.distributed.kv_transfer.kv_connector.v1.umbp.connector import (
 )
 from vllm.distributed.kv_transfer.kv_connector.v1.umbp.data import (
     BlockIdentityCodec,
+    BlockLoadBatch,
     BlockTransferPlan,
     KVLayoutDescriptor,
     KVLayoutPlanner,
@@ -54,6 +56,8 @@ from vllm.distributed.kv_transfer.kv_connector.v1.umbp.worker import (
     UMBPStoreConnectorWorker,
 )
 from vllm.v1.attention.backends.utils import NULL_BLOCK_ID
+from vllm.v1.core.kv_cache_utils import maybe_convert_block_hash
+from vllm.v1.serial_utils import MsgpackDecoder, MsgpackEncoder
 
 
 def test_block_identity_codec_does_not_use_physical_block_id():
@@ -278,6 +282,10 @@ def test_materialization_preserves_plan_metadata_after_reregistration():
         2,
         request_id="req",
         group_id=0,
+        block_hash=b"hash",
+        parent_block_hash=b"parent",
+        token_ids=(1, 2),
+        block_size=16,
     )
     previous = None
     for _ in range(2):
@@ -331,12 +339,21 @@ def test_load_spec_reports_only_external_tokens():
 
 
 def test_worker_metadata_aggregates_store_events():
-    metadata = UMBPConnectorWorkerMetadata(store_events={7: StoreEventResult(1)})
-    other = UMBPConnectorWorkerMetadata(store_events={7: StoreEventResult(1)})
+    metadata = UMBPConnectorWorkerMetadata(
+        store_events={7: StoreEventResult(1, {(0, b"a")})}
+    )
+    other = UMBPConnectorWorkerMetadata(
+        store_events={7: StoreEventResult(1, {(1, b"b")})}
+    )
     metadata.aggregate(other)
 
-    assert metadata.store_events == {7: StoreEventResult(2)}
-    assert other.store_events == {7: StoreEventResult(1)}
+    assert metadata.store_events == {7: StoreEventResult(2, {(0, b"a"), (1, b"b")})}
+    assert other.store_events == {7: StoreEventResult(1, {(1, b"b")})}
+
+    restored = MsgpackDecoder(UMBPConnectorWorkerMetadata).decode(
+        MsgpackEncoder().encode(metadata)
+    )
+    assert restored == metadata
 
 
 @pytest.mark.parametrize("mode", ["embedded"])
@@ -510,15 +527,34 @@ def test_scheduler_emits_async_load_without_scheduled_model_tokens():
     assert scheduler._pending_loads == {}
 
 
+def test_load_batch_metadata_roundtrip_preserves_destinations_and_identity():
+    batch = BlockLoadBatch(["g1", "g0"], [7, 3], [1, 0], "r")
+    meta = UMBPConnectorMetadata(load_requests={"r": batch})
+    restored = (
+        MsgpackDecoder(UMBPConnectorMetadata)
+        .decode(MsgpackEncoder().encode(meta))
+        .load_requests["r"]
+    )
+    assert list(restored) == [
+        BlockTransferPlan("g1", 7, group_id=1, request_id="r"),
+        BlockTransferPlan("g0", 3, group_id=0, request_id="r"),
+    ]
+    assert restored[:1] == [restored[0]]
+    with pytest.raises(ValueError, match="equal lengths"):
+        BlockLoadBatch(["missing-destination"], [], [0], "r")
+
+
 def test_scheduler_cached_decode_uses_save_watermark_and_new_blocks():
+    vllm_config = _vllm_config(
+        {
+            "mode": "embedded",
+            "load_async": False,
+            "save_decode_cache": True,
+        }
+    )
+    vllm_config.kv_events_config = SimpleNamespace(enable_kv_cache_events=True)
     scheduler = UMBPStoreConnectorScheduler(
-        _vllm_config(
-            {
-                "mode": "embedded",
-                "load_async": False,
-                "save_decode_cache": True,
-            }
-        ),
+        vllm_config,
         _kv_cache_config(),
         _SchedulerHandle([]),
         BlockIdentityCodec(UMBPNamespace("decode")),
@@ -528,6 +564,7 @@ def test_scheduler_cached_decode_uses_save_watermark_and_new_blocks():
         req_id="decode",
         num_tokens=48,
         num_prompt_tokens=32,
+        all_token_ids=list(range(48)),
         block_hashes=[b"a", b"b", b"c"],
         block_ids=([1, 2, 3],),
         num_computed_tokens=32,
@@ -556,6 +593,7 @@ def test_scheduler_cached_decode_uses_save_watermark_and_new_blocks():
 
     second = scheduler.build_connector_meta(output(48, ()))
     assert [plan.block_id for plan in second.store_plans] == [3]
+    assert second.store_plans[0].token_ids == tuple(range(32, 48))
 
 
 def test_scheduler_decode_store_skips_unverified_speculative_tokens():
@@ -674,6 +712,42 @@ def test_kv_consumer_never_stores(kv_role):
     stored = [plan.block_id for plan in metadata.store_plans]
     assert stored == ([] if kv_role == "kv_consumer" else [3, 4])
     assert bool(metadata.store_requests) == (kv_role != "kv_consumer")
+
+
+@pytest.mark.parametrize("resident", [False, True])
+def test_restored_prefix_skips_resident_blocks(resident):
+    """A restored block that is still in the pool is not stored again."""
+    codec = BlockIdentityCodec(UMBPNamespace("restored-residency"))
+    handle = _SchedulerHandle({})
+    scheduler = UMBPStoreConnectorScheduler(
+        _vllm_config({"mode": "embedded"}), _kv_cache_config(), handle, codec
+    )
+    request = SimpleNamespace(
+        request_id="req",
+        req_id="req",
+        num_tokens=49,
+        block_hashes=[b"a", b"b", b"c"],
+        block_ids=([1, 2, 3],),
+        num_computed_tokens=0,
+    )
+    scheduler.update_state_after_alloc(
+        request, SimpleNamespace(get_block_ids=lambda group_ids: request.block_ids), 0
+    )
+    scheduler._request_trackers["req"].load_spec = LoadSpec(0, 32)
+    handle.hits = {codec.key(h, 0): resident for h in (b"a", b"b")}
+    meta = scheduler.build_connector_meta(
+        SimpleNamespace(
+            finished_req_ids=set(),
+            preempted_req_ids=set(),
+            scheduled_new_reqs=[request],
+            scheduled_cached_reqs=SimpleNamespace(req_ids=[]),
+            num_scheduled_tokens={"req": 48},
+        )
+    )
+
+    stored = [b"c"] if resident else [b"a", b"b", b"c"]
+    assert [plan.key for plan in meta.store_plans] == [codec.key(h, 0) for h in stored]
+    scheduler.close()
 
 
 def test_store_event_owns_refs_until_all_ranks_finish():
@@ -870,7 +944,9 @@ def test_scheduler_stores_from_cores_current_block_table():
                 resumed_req_ids=set(),
             ),
             num_scheduled_tokens={"r": 32},
-            kv_connector_block_state=SimpleNamespace(get_block_ids=current.get),
+            kv_connector_block_state=SimpleNamespace(
+                get_block_ids=current.get, boundary_state_offloads={}
+            ),
         )
     )
 
@@ -995,7 +1071,7 @@ def test_async_stores_keep_independent_events_across_steps(fail_first):
     assert not handle.waited
 
 
-def test_preemption_waits_for_pending_stores_from_previous_steps():
+def test_preemption_cancels_pending_stores_from_previous_steps():
     handle = _DelayedStoreWorkerHandle()
     worker = UMBPStoreConnectorWorker(handle)
     for event_id, request_id in enumerate(("first", "other", "first")):
@@ -1009,12 +1085,14 @@ def test_preemption_waits_for_pending_stores_from_previous_steps():
         )
         worker.wait_for_save()
     worker.handle_preemptions(UMBPConnectorMetadata(preempted_request_ids={"first"}))
-    assert handle.waited == [handle.jobs[0], handle.jobs[2]]
     worker.get_finished(set())
+    assert handle.cancelled == [handle.jobs[0], handle.jobs[2]]
     assert worker.build_connector_worker_meta().store_events == {
         0: StoreEventResult(1),
         2: StoreEventResult(1),
     }
+    assert not handle.publications
+    assert not handle.waited
     handle.jobs[1].complete()
     worker.get_finished(set())
     assert worker.build_connector_worker_meta().store_events == {1: StoreEventResult(1)}
@@ -1033,25 +1111,64 @@ def test_async_store_drains_before_buffers_can_be_reused():
     assert worker.build_connector_worker_meta().store_events == {4: StoreEventResult(1)}
 
 
-def test_preemption_waits_only_for_the_preempted_requests_loads():
-    handle = _WaitRecordingDelayedLoadHandle()
+def test_worker_preemption_cancels_only_matching_request():
+    handle = _CancellableWorkerHandle()
     worker = UMBPStoreConnectorWorker(handle)
+    first = BlockTransferPlan("first", 1, request_id="first")
+    second = BlockTransferPlan("second", 2, request_id="second")
+    worker.enqueue_stores(
+        UMBPConnectorMetadata(
+            store_event=21,
+            store_plans=[first, second],
+            store_requests={"first": [first], "second": [second]},
+        )
+    )
+
+    worker.handle_preemptions(UMBPConnectorMetadata(preempted_request_ids={"first"}))
+
+    assert len(handle.cancelled) == 1
+    assert handle.cancelled[0].plans == (first,)
+    assert worker.build_connector_worker_meta().store_events == {}
+    worker.wait_for_save()
+    assert handle.published.plans == (second,)
+    assert worker.build_connector_worker_meta().store_events == {
+        21: StoreEventResult(1)
+    }
+
+
+@pytest.mark.parametrize("async_load", [False, True])
+def test_load_cancellation_preserves_other_requests(async_load):
+    handle = _CancellableWorkerHandle()
+    worker = UMBPStoreConnectorWorker(handle)
+    plans = {
+        name: [
+            BlockTransferPlan(
+                name,
+                block_id,
+                request_id=name,
+                ranges=(KVRange("layer1", 0, block_id, 1000, 16, 16, 0),),
+            )
+        ]
+        for name, block_id in (("first", 1), ("second", 2))
+    }
     worker.start_load_kv(
         None,
         UMBPConnectorMetadata(
-            async_load=True,
-            load_requests={
-                name: [BlockTransferPlan(name, block_id, request_id=name)]
-                for name, block_id in (("first", 1), ("second", 2))
-            },
+            async_load=async_load,
+            load_requests=plans,
         ),
     )
     worker.handle_preemptions(UMBPConnectorMetadata(preempted_request_ids={"first"}))
+    worker.wait_for_layer_load("")
+    # Asynchronous loads settle through get_finished, not the forward pass.
+    finished = worker.get_finished(set())
 
-    assert [job.plans[0].request_id for job in handle.waited] == ["first"]
-    assert worker.get_finished(set()) == (None, None)
-    handle.load_job.complete()
-    assert worker.get_finished(set()) == (None, {"second"})
+    assert len(handle.cancelled) == 1
+    assert handle.cancelled[0].plans[0].request_id == "first"
+    assert worker.get_kv_connector_stats().reduce()["load_completed"] == 1
+    assert finished == (None, {"second"} if async_load else None)
+    worker.wait_for_layer_load("")
+    assert worker.get_kv_connector_stats() is None
 
 
 def test_worker_reports_load_completion_and_store_event_without_deferring_request():
@@ -1096,6 +1213,7 @@ def test_worker_partial_store_failure_reports_unpublished_objects():
     metadata = worker.build_connector_worker_meta()
     assert metadata.store_events == {9: StoreEventResult(1)}
     assert not hasattr(worker.runtime, "published")
+    assert worker.get_kv_connector_stats().reduce()["store_failed"] == 1
 
 
 @pytest.mark.parametrize("forward", [False, True])
@@ -1138,6 +1256,10 @@ def test_connector_finalizes_each_store_once_when_forward_hook_is_skipped(
         assert next_step == ({} if forward else expected)
         assert plan.key in runtime.store
 
+    stats = connector.get_kv_connector_stats().reduce()
+    assert stats["store_submitted"] == 2
+    assert stats["store_completed"] == 2
+
 
 def test_worker_preserves_scheduler_supplied_ranges():
     handle = _WorkerHandle()
@@ -1178,7 +1300,8 @@ def test_worker_preserves_scheduler_supplied_ranges():
     assert handle.loaded_plans == [supplied]
 
 
-def test_embedded_connector_core_flow(monkeypatch):
+@pytest.mark.parametrize("enable_events", [False, True])
+def test_embedded_connector_core_flow(monkeypatch, enable_events):
     runtime = _EmbeddedRuntime()
     monkeypatch.setitem(
         UMBPRuntimeFactory._builders,
@@ -1187,11 +1310,14 @@ def test_embedded_connector_core_flow(monkeypatch):
     )
     config = _kv_cache_config()
     vllm_config = _vllm_config({"mode": "embedded", "load_async": False})
+    if enable_events:
+        vllm_config.kv_events_config = SimpleNamespace(enable_kv_cache_events=True)
     producer = SimpleNamespace(
         request_id="producer",
         req_id="producer",
         num_tokens=32,
         prompt_token_ids=list(range(32)),
+        all_token_ids=list(range(32)),
         block_hashes=[b"a", b"b"],
         block_ids=([1, 2],),
         num_computed_tokens=0,
@@ -1225,9 +1351,29 @@ def test_embedded_connector_core_flow(monkeypatch):
         0,
     )
     metadata = scheduler_connector.build_connector_meta(scheduler_output)
+    assert [plan.token_ids for plan in metadata.store_plans] == (
+        [tuple(range(16)), tuple(range(16, 32))] if enable_events else [(), ()]
+    )
+    assert [plan.parent_block_hash for plan in metadata.store_plans] == (
+        [None, b"a"] if enable_events else [None, None]
+    )
     worker_connector.bind_connector_metadata(metadata)
     worker_connector.wait_for_save()
     assert runtime.store
+    worker_meta = worker_connector.build_connector_worker_meta()
+    worker_events = worker_connector.get_kv_connector_kv_cache_events()
+    scheduler_connector.update_connector_output(
+        SimpleNamespace(
+            kv_connector_worker_meta=worker_meta,
+            kv_cache_events=worker_events,
+        )
+    )
+    events = list(scheduler_connector.take_events())
+    if enable_events:
+        assert len(events) == 2
+        assert events[0].block_hashes == [maybe_convert_block_hash(b"a")]
+    else:
+        assert events == []
 
     consumer = SimpleNamespace(
         request_id="consumer",
@@ -1585,6 +1731,7 @@ def test_worker_localizes_scheduler_plan_key_to_its_tp_rank(
         key=BlockIdentityCodec(UMBPNamespace("rank-local")).key(b"hash", 0),
         block_id=1,
         group_id=0,
+        block_hash=b"hash",
     )
     metadata = UMBPConnectorMetadata(store_plans=[plan], store_event=7)
 
@@ -1593,34 +1740,44 @@ def test_worker_localizes_scheduler_plan_key_to_its_tp_rank(
 
     assert handle.store_calls[0][0].key == codec.key(b"hash", 0)
     worker_meta = worker.build_connector_worker_meta()
-    assert worker_meta.store_events == {7: StoreEventResult(1)}
+    assert worker_meta.store_events == {
+        7: StoreEventResult(
+            1,
+            {(0, b"hash")} if fail_store else set(),
+        )
+    }
     assert hasattr(handle, "published") != fail_store
 
 
 @pytest.mark.parametrize("tp_rank", [0, 3])
-def test_load_localizes_rank_without_changing_request_or_destination(tp_rank):
+@pytest.mark.parametrize("fast_path", [False, True])
+def test_batched_load_localizes_rank_without_changing_request_or_destination(
+    tp_rank, fast_path
+):
+    """Fast and fallback loads target the same rank and GPU blocks."""
     codec = BlockIdentityCodec(UMBPNamespace("rank-local"), tp_rank=tp_rank)
     scheduler_codec = replace(codec, tp_rank=0)
     calls = []
 
     def load(plans):
         calls.append(plans)
-        job = TransferJobState(tuple(plans))
+        job = TransferJobState(plans if fast_path else tuple(plans))
         job.start()
         job.complete([codec.key(b"a", 0)])
         job.fail([codec.key(b"b", 1)], "injected load failure")
         return job
 
-    worker = UMBPStoreConnectorWorker(SimpleNamespace(load=load), codec=codec)
-    plans = [
-        BlockTransferPlan(
-            scheduler_codec.key(b"a", 0), 7, request_id="request", group_id=0
-        ),
-        BlockTransferPlan(
-            scheduler_codec.key(b"b", 1), 9, request_id="request", group_id=1
-        ),
-    ]
-    worker.start_load_kv(None, UMBPConnectorMetadata(load_requests={"request": plans}))
+    handle = SimpleNamespace(load=load)
+    if fast_path:
+        handle.load_blocks = load
+    worker = UMBPStoreConnectorWorker(handle, codec=codec)
+    batch = BlockLoadBatch(
+        [scheduler_codec.key(b"a", 0), scheduler_codec.key(b"b", 1)],
+        [7, 9],
+        [0, 1],
+        "request",
+    )
+    worker.start_load_kv(None, UMBPConnectorMetadata(load_requests={"request": batch}))
 
     assert len(calls) == 1
     assert [(p.key, p.block_id, p.group_id, p.request_id) for p in calls[0]] == [
@@ -1629,6 +1786,7 @@ def test_load_localizes_rank_without_changing_request_or_destination(tp_rank):
     ]
     job = worker._load_jobs["request"][None]
     assert job.failed_block_ids == {9}
+    assert batch.keys == [scheduler_codec.key(b"a", 0), scheduler_codec.key(b"b", 1)]
 
 
 @pytest.mark.parametrize("empty_group", [False, True])
@@ -1685,3 +1843,4 @@ def test_worker_submits_stores_once(grouped):
     assert worker.get_finished({"req"}) == (None, None)
     completed = worker.build_connector_worker_meta()
     assert completed.store_events == {19: StoreEventResult(1)}
+    assert worker.get_kv_connector_stats().reduce()["store_num_bytes"] == 32
