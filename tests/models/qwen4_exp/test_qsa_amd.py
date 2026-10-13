@@ -32,6 +32,29 @@ requires_qsa_kernels = pytest.mark.skipif(
 )
 
 
+@pytest.mark.parametrize(
+    ("connector", "extra", "message"),
+    [
+        ("NixlConnector", {}, "only UMBPStoreConnector"),
+        (
+            "UMBPStoreConnector",
+            {"enable_partial_hash_hits": True},
+            "compression boundary",
+        ),
+    ],
+)
+def test_qsa_rejects_unsupported_external_restore(connector, extra, message):
+    from vllm.models.qwen4_exp.amd.qsa import Qwen4ExpQSAAttention
+
+    config = SimpleNamespace(
+        kv_transfer_config=SimpleNamespace(
+            kv_connector=connector, kv_connector_extra_config=extra
+        )
+    )
+    with pytest.raises(NotImplementedError, match=message):
+        Qwen4ExpQSAAttention(vllm_config=config, config=None, layer_id=0)
+
+
 def test_ple_ngram_embedding_custom_op_uses_resident_weight(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

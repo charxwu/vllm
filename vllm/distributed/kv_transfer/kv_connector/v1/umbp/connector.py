@@ -131,6 +131,7 @@ class UMBPStoreConnector(KVConnectorBase_V1, SupportsHMA):
                 ),
                 layout,
                 codec=codec,
+                report_failed_requests=len(kv_cache_config.kv_cache_groups) > 1,
                 layerwise_load=runtime.capabilities.layerwise_load,
                 layerwise_store=runtime.capabilities.layerwise_store,
                 enable_kv_cache_events=bool(

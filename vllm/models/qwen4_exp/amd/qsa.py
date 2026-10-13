@@ -93,7 +93,7 @@ class Qwen4ExpQSAFlashAttentionBackend(FlashAttentionBackend):
 
     @classmethod
     def supports_kv_connector(cls) -> bool:
-        return False
+        return True
 
 
 class Qwen4ExpQSAFlashAttentionImpl(FlashAttentionImpl):
@@ -181,6 +181,19 @@ class Qwen4ExpQSAAttention(Qwen3NextAttention, AttentionLayerBase):
         prefix: str = "",
     ) -> None:
         nn.Module.__init__(self)
+        transfer = vllm_config.kv_transfer_config
+        if transfer is not None:
+            if transfer.kv_connector != "UMBPStoreConnector":
+                raise NotImplementedError(
+                    "AMD Qwen4Exp QSA currently supports only UMBPStoreConnector"
+                )
+            if transfer.kv_connector_extra_config.get(
+                "enable_partial_hash_hits", False
+            ):
+                raise NotImplementedError(
+                    "QSA UMBP restore requires complete cache blocks so the raw-key "
+                    "ring starts at a compression boundary"
+                )
         cache_config = vllm_config.cache_config
         model_config = vllm_config.model_config
         if cache_config is None:

@@ -1,0 +1,59 @@
+From cd9772b5944976926950f54ebbc4794077ffde54 Mon Sep 17 00:00:00 2001
+From: tjtanaa <tunjian.tan@embeddedllm.com>
+Date: Mon, 12 Oct 2026 17:40:28 +0000
+Subject: [PATCH] fix(umbp): acknowledge local clear when no master is
+ configured
+
+ClearLocal gates backend allocations until full-sync acknowledgment. In
+embedded mode no master exists to send that acknowledgment, so acknowledge
+locally once clear finishes. Preserve the master-backed RPC failure path.
+Cover repeated native ranged store/clear/store/restore cycles.
+
+Co-authored-by: Codex <noreply@openai.com>
+Signed-off-by: tjtanaa <tunjian.tan@embeddedllm.com>
+---
+ src/umbp/distributed/pool_client.cpp      |  3 +++
+ tests/python/umbp/test_umbp_client_ptr.py | 19 +++++++++++++++++++
+ 2 files changed, 22 insertions(+)
+
+diff --git a/src/umbp/distributed/pool_client.cpp b/src/umbp/distributed/pool_client.cpp
+index 266f8d8..b111d6d 100644
+--- a/src/umbp/distributed/pool_client.cpp
++++ b/src/umbp/distributed/pool_client.cpp
+@@ -1336,6 +1336,9 @@ bool PoolClient::Clear() {
+   if (master_client_) {
+     ok = master_client_->ClearFullSync();
+     if (!ok) MORI_UMBP_WARN("[PoolClient] Clear full-sync heartbeat failed");
++  } else {
++    // No master holds stale placements, so local clear needs no remote ack.
++    for (auto* backend : registry_.All()) backend->ClearFullSyncAcked();
+   }
+   return ok;
+ }
+diff --git a/tests/python/umbp/test_umbp_client_ptr.py b/tests/python/umbp/test_umbp_client_ptr.py
+index 95333d9..7aeb12a 100644
+--- a/tests/python/umbp/test_umbp_client_ptr.py
++++ b/tests/python/umbp/test_umbp_client_ptr.py
+@@ -195,3 +195,22 @@ def test_batch_get_with_ssd_enabled(tmp_path):
+     assert mem_pool.read_page_k(0)[0] == ord("M")
+     assert mem_pool.read_page_v(0)[0] == ord("N")
+     assert client.clear()
++
++
++@pytest.mark.parametrize("ssd_enabled", [False, True])
++def test_no_master_clear_allows_new_ranged_put_and_restore(tmp_path, ssd_enabled):
++    """A successful local clear must reopen every backend for fresh writes."""
++    client = _make_client(ssd_dir=tmp_path / "reset-ssd" if ssd_enabled else None)
++    key = "reset-range"
++    for cycle in range(3):
++        data = (ctypes.c_ubyte * 256)(*([cycle + 1] * 256))
++        out = (ctypes.c_ubyte * 256)()
++        assert client.batch_put_ranges_from_ptr(
++            [key], [256], [[ctypes.addressof(data)]], [[256]], [[0]]
++        ) == [True]
++        assert client.batch_get_ranges_into_ptr(
++            [key], [[ctypes.addressof(out)]], [[256]], [[0]]
++        ) == [True]
++        assert bytes(out) == bytes(data)
++        assert client.clear()
++        assert not client.exists(key)
