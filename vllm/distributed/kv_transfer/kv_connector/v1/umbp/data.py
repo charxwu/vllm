@@ -22,7 +22,11 @@ from vllm.distributed.kv_transfer.kv_connector.v1.base import (
     KVConnectorMetadata,
     KVConnectorWorkerMetadata,
 )
-from vllm.v1.kv_cache_interface import KVCacheConfig
+from vllm.v1.kv_cache_interface import (
+    KVCacheConfig,
+    UniformTypeKVCacheSpecs,
+    iter_layer_specs,
+)
 
 
 @dataclass(frozen=True)
@@ -125,6 +129,12 @@ class UMBPNamespace:
 
         model_config = vllm_config.model_config
         parallel_config = vllm_config.parallel_config
+        # Core unwraps UniformTypeKVCacheSpecs for the scheduler. Use the
+        # same representative layer spec on both sides of the lookup bridge.
+        group_specs = [
+            next(iter(iter_layer_specs(group.kv_cache_spec)))
+            for group in kv_cache_config.kv_cache_groups
+        ]
         fields = {
             "model": getattr(model_config, "model", ""),
             "revision": getattr(model_config, "revision", None),
@@ -134,10 +144,12 @@ class UMBPNamespace:
                 {
                     "layers": group.layer_names,
                     "block_size": group.kv_cache_spec.block_size,
-                    "kind": type(group.kv_cache_spec).__name__,
-                    "dtype": str(getattr(group.kv_cache_spec, "dtype", None)),
+                    "kind": type(spec).__name__,
+                    "dtype": str(getattr(spec, "dtype", None)),
                 }
-                for group in kv_cache_config.kv_cache_groups
+                for group, spec in zip(
+                    kv_cache_config.kv_cache_groups, group_specs, strict=True
+                )
             ],
             "tp": parallel_config.tensor_parallel_size,
             "pp": parallel_config.pipeline_parallel_size,
@@ -268,6 +280,9 @@ class KVLayoutPlanner:
                 if group_id is None:
                     continue
                 spec = config.kv_cache_groups[group_id].kv_cache_spec
+                if isinstance(spec, UniformTypeKVCacheSpecs):
+                    # The wrapper page size sums all layers, not this region.
+                    spec = spec.kv_cache_specs[layer_name]
                 block_bytes = spec.page_size_bytes
                 regions.append(
                     KVRegion(

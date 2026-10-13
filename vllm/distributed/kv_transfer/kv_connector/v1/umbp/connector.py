@@ -91,6 +91,16 @@ class UMBPStoreConnector(KVConnectorBase_V1, SupportsHMA):
             raise NotImplementedError(
                 "embedded UMBP does not support pipeline parallelism"
             )
+        # Prefix restore skips draft prefill, so draft KV cannot be omitted.
+        for group_id, group in enumerate(kv_cache_config.kv_cache_groups):
+            if (
+                group.is_eagle_group
+                and group_id not in kv_cache_config.prefix_cacheable_group_ids
+            ):
+                raise NotImplementedError(
+                    f"UMBP requires EAGLE draft cache group {group_id} to be "
+                    "prefix-cacheable and enabled for KV transfer"
+                )
         runtime = UMBPRuntimeFactory.build(runtime_config)
         if (
             runtime_config.options.get("enable_partial_hash_hits", False)
@@ -107,7 +117,13 @@ class UMBPStoreConnector(KVConnectorBase_V1, SupportsHMA):
             pcp_rank=topology.pcp_rank,
             dcp_rank=topology.dcp_rank,
         )
-        layout = KVLayoutPlanner.from_kv_cache_config(kv_cache_config)
+        # Core may replace per-layer geometry with a representative scheduler
+        # spec. Only workers have the physical page sizes needed for transfers.
+        layout = (
+            KVLayoutPlanner.from_kv_cache_config(kv_cache_config)
+            if role == KVConnectorRole.WORKER
+            else KVLayoutPlanner(())
+        )
         layout_descriptor = layout.describe(topology)
         self._runtime = runtime
         self._store_submitted = False
@@ -131,6 +147,7 @@ class UMBPStoreConnector(KVConnectorBase_V1, SupportsHMA):
                 ),
                 layout,
                 codec=codec,
+                report_failed_requests=len(kv_cache_config.kv_cache_groups) > 1,
                 layerwise_load=runtime.capabilities.layerwise_load,
                 layerwise_store=runtime.capabilities.layerwise_store,
                 enable_kv_cache_events=bool(

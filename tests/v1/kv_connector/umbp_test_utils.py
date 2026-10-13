@@ -228,3 +228,59 @@ def install_memory_runtime(monkeypatch):
     runtime = MemoryRuntime()
     monkeypatch.setitem(UMBPRuntimeFactory._builders, "embedded", lambda _: runtime)
     return runtime
+
+
+def minimax_m3_kv_cache_config():
+    """TP4 FP8 target/indexer/draft pages with block-outermost placement."""
+    from vllm.v1.kv_cache_interface import (
+        FullAttentionSpec,
+        KVCacheConfig,
+        KVCacheGroupSpec,
+        KVCacheTensor,
+        MLAAttentionSpec,
+        SparseCacheRole,
+    )
+
+    main = FullAttentionSpec(
+        block_size=128,
+        num_kv_heads=1,
+        head_size=128,
+        dtype=torch.float8_e4m3fn,
+        num_head_slots=2,
+        state_content_bytes=128,
+    )
+    indexer = MLAAttentionSpec(
+        block_size=128,
+        num_kv_heads=1,
+        head_size=128,
+        dtype=torch.float8_e4m3fn,
+        cache_role=SparseCacheRole.INDEXER,
+    )
+    draft = FullAttentionSpec(
+        block_size=128,
+        num_kv_heads=1,
+        head_size=128,
+        dtype=torch.float8_e4m3fn,
+    )
+    specs = (main, indexer, draft)
+    names = ("target.attn", "target.attn.indexer", "draft.attn")
+    stride = sum(spec.page_size_bytes for spec in specs)
+    offsets = (0, main.page_size_bytes, main.page_size_bytes + indexer.page_size_bytes)
+    return KVCacheConfig(
+        num_blocks=8,
+        kv_cache_tensors=[
+            KVCacheTensor(
+                size=8 * stride,
+                layers=[name],
+                layer_stride=spec.page_size_bytes,
+                block_stride=stride,
+                offset=offset,
+            )
+            for name, spec, offset in zip(names, specs, offsets)
+        ],
+        kv_cache_groups=[
+            KVCacheGroupSpec([names[0]], main),
+            KVCacheGroupSpec([names[1]], indexer),
+            KVCacheGroupSpec([names[2]], draft, is_eagle_group=True),
+        ],
+    )

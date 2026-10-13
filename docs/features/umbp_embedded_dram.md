@@ -238,3 +238,61 @@ Within the intentionally narrow scope of local UMBP-managed DRAM offloading:
 The primary remaining work is validation and hardening around lazy offload,
 eviction, preemption, additional parallel layouts, hybrid KV caches, and
 performance under sustained concurrent load.
+
+## MiniMax M3 MXFP4 with EAGLE3 on ROCm
+
+MiniMax M3 has a key-only sparse-indexer cache in addition to its main K/V
+cache. EAGLE3 adds draft-model K/V pages. An external prefix is usable only
+when every required cache group is present on every participating TP rank.
+Restores must finish before either the sparse indexer or draft model executes;
+use asynchronous connector loads for this layout. UMBP rejects EAGLE groups
+that cannot participate in prefix caching or external KV transfer.
+
+For `amd/MiniMax-M3-MXFP4` with TP4, block size 128, FP8 main and indexer
+caches, and `Inferact/MiniMax-M3-EAGLE3-GQA` with three speculative tokens:
+
+- Build MoRI with `BUILD_UMBP=ON` and gRPC/Protobuf development dependencies.
+  Confirm the native `UMBPClient`, `UMBPConfig`, and `MemoryLocationType`
+  exports, memory registration, and ranged-pointer transfer methods.
+  Also validate a native store, clear, fresh store, and restore cycle. MoRI
+  v1.2.4 requires the no-master clear acknowledgment fix; otherwise reset
+  reports success but subsequent embedded stores fail with `CLEAR_PENDING`.
+- Build the `vllm._rust_tool_parser` extension when serving with
+  `--tool-call-parser minimax_m3`; the Python server requires it too.
+- Use AITER with the MiniMax MSA score/top-k kernels. The ROCm base-image
+  recipe pins v0.1.21.post2; v0.1.19 does not provide `aiter.ops.msa_attention`.
+- Set `VLLM_ROCM_USE_AITER=1` and
+  `VLLM_ROCM_SHUFFLE_KV_CACHE_LAYOUT=1`. The FP8 AITER indexer is coupled to
+  the shuffled sparse-attention cache layout; the Triton indexer fallback
+  does not support FP8.
+- Set `--attention-config '{"indexer_kv_dtype":"fp8"}'` independently of
+  `--kv-cache-dtype fp8`. Preserve the speculative configuration in both
+  the GPU-resident baseline and offload comparison.
+
+Add the following to an otherwise identical baseline command:
+
+```bash
+--kv-transfer-config '{
+  "kv_connector": "UMBPStoreConnector",
+  "kv_role": "kv_both",
+  "kv_connector_extra_config": {
+    "mode": "embedded",
+    "capacity_bytes": 8589934592,
+    "load_async": true,
+    "lookup_async": false,
+    "lazy_offload": false,
+    "num_workers": 4,
+    "timeout_ms": 60000
+  }
+}'
+```
+
+`capacity_bytes` is per rank (32 GiB total at TP4). For correctness validation,
+compare cold generation with replay after a successful GPU prefix-cache reset
+that preserves the external store. Require completed UMBP loads and external
+hit tokens, and check target output tokens and transfer failures. Matching
+outputs alone do not establish that offloading occurred. Also compare EAGLE
+draft acceptance across cold, native-prefix, and externally restored runs;
+missing draft state can reduce speculative acceptance without changing target
+output tokens. Serving request
+concurrency is a client setting; `--max-num-seqs` is the scheduler limit.

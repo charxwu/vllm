@@ -53,15 +53,19 @@ from vllm.distributed.kv_transfer.kv_connector.v1.umbp.worker import (
 from vllm.v1.attention.backends.utils import NULL_BLOCK_ID
 from vllm.v1.core.block_pool import BlockPool
 from vllm.v1.core.kv_cache_utils import (
+    generate_scheduler_kv_cache_config,
     make_block_hash_with_group_id,
     maybe_convert_block_hash,
 )
 from vllm.v1.kv_cache_interface import (
+    CircularBufferSpec,
     FullAttentionSpec,
     KVCacheConfig,
     KVCacheGroupSpec,
     KVCacheTensor,
     MambaSpec,
+    MLAAttentionSpec,
+    UniformTypeKVCacheSpecs,
 )
 from vllm.v1.serial_utils import MsgpackDecoder, MsgpackEncoder
 
@@ -1683,9 +1687,9 @@ def test_scheduler_stores_exact_hybrid_boundary_state():
         SimpleNamespace(
             finished_req_ids=set(),
             preempted_req_ids=set(),
-            scheduled_new_reqs=[],
+            scheduled_new_reqs=[request],
             scheduled_cached_reqs=SimpleNamespace(req_ids=[]),
-            num_scheduled_tokens={},
+            num_scheduled_tokens={request.req_id: 16},
             kv_connector_block_state=SimpleNamespace(
                 boundary_state_offloads={
                     "hybrid": [
@@ -1697,11 +1701,106 @@ def test_scheduler_stores_exact_hybrid_boundary_state():
         )
     )
 
-    assert len(metadata.store_plans) == 1
-    plan = metadata.store_plans[0]
+    # The live state slots [8, 9] are not snapshots at token offsets [16, 32].
+    # Only the explicit hand-off of block 9 at token 16 may be stored.
+    assert len(metadata.store_plans) == 3
+    [plan] = [plan for plan in metadata.store_plans if plan.group_id == 1]
     assert plan.group_id == 1
     assert plan.block_id == 9
     assert plan.block_hash == b"a"
+    scheduler.close()
+
+
+@pytest.mark.parametrize("missing_group", [None, 0, 2, 3, 4])
+def test_qsa_restore_requires_compressed_keys_and_both_state_groups(missing_group):
+    """A raw-key ring is scratch; every persistent group must share a boundary."""
+    config = _hybrid_kv_cache_config()
+    full, gdn = (group.kv_cache_spec for group in config.kv_cache_groups)
+    ring = CircularBufferSpec(
+        block_size=4,
+        num_kv_heads=1,
+        head_size=8,
+        head_size_v=0,
+        dtype=torch.bfloat16,
+    )
+    compressed = MLAAttentionSpec(
+        block_size=16,
+        num_kv_heads=1,
+        head_size=8,
+        dtype=torch.bfloat16,
+        tokens_per_state=4,
+    )
+    ple = replace(gdn, shapes=((3, 8),), dtypes=(torch.bfloat16,))
+    config.kv_cache_groups = [
+        KVCacheGroupSpec(["attention"], full),
+        KVCacheGroupSpec(["raw_keys"], ring),
+        KVCacheGroupSpec(["compressed_keys"], compressed),
+        KVCacheGroupSpec(["gdn"], gdn),
+        KVCacheGroupSpec(["ple"], ple),
+    ]
+    codec = BlockIdentityCodec(UMBPNamespace("qsa"))
+    hits = {
+        codec.key(block_hash, group): True
+        for group in (0, 2, 3, 4)
+        if group != missing_group
+        for block_hash in (b"a", b"b")
+    }
+    scheduler = UMBPStoreConnectorScheduler(
+        _vllm_config({"load_async": False}), config, _SchedulerHandle(hits), codec
+    )
+    request = SimpleNamespace(
+        request_id="qsa", num_tokens=35, block_hashes=[b"a", b"b"]
+    )
+    try:
+        matched, asynchronous = scheduler.get_num_new_matched_tokens(request, 0)
+        if missing_group is not None:
+            assert (matched, asynchronous) == (0, False)
+            return
+        assert (matched, asynchronous) == (32, True)
+        assert matched % compressed.tokens_per_state == 0
+        blocks = ([10, 11], [12], [13, 14], [0, 15], [0, 16])
+        scheduler.update_state_after_alloc(
+            request,
+            SimpleNamespace(
+                get_block_ids=lambda group_ids: tuple(
+                    blocks[group] for group in group_ids
+                )
+            ),
+            matched,
+        )
+        metadata = scheduler.build_connector_meta(
+            SimpleNamespace(
+                finished_req_ids=set(),
+                preempted_req_ids=set(),
+                scheduled_new_reqs=[],
+                scheduled_cached_reqs=SimpleNamespace(req_ids=[]),
+                num_scheduled_tokens={},
+            )
+        )
+        assert metadata.async_load
+        plans = metadata.load_requests[request.request_id]
+        assert [(p.group_id, p.block_id) for p in plans] == [
+            (0, 10),
+            (0, 11),
+            (2, 13),
+            (2, 14),
+            (3, 15),
+            (4, 16),
+        ]
+        assert (
+            scheduler.build_connector_meta(
+                SimpleNamespace(
+                    finished_req_ids=set(),
+                    preempted_req_ids=set(),
+                    scheduled_new_reqs=[],
+                    scheduled_cached_reqs=SimpleNamespace(req_ids=[]),
+                    num_scheduled_tokens={},
+                )
+            ).load_requests
+            == {}
+        )
+    finally:
+        scheduler.close()
 
 
 class _WorkerHandle:
@@ -1771,9 +1870,14 @@ class _DelayedLoadWorkerHandle(_WorkerHandle):
 
 
 @pytest.mark.parametrize("fail_load", [False, True])
-def test_worker_polls_async_load_without_forward_execution(fail_load):
+@pytest.mark.parametrize("report_failed_requests", [False, True])
+def test_worker_polls_async_load_without_forward_execution(
+    fail_load, report_failed_requests
+):
     handle = _DelayedLoadWorkerHandle()
-    worker = UMBPStoreConnectorWorker(handle, layerwise_load=True)
+    worker = UMBPStoreConnectorWorker(
+        handle, layerwise_load=True, report_failed_requests=report_failed_requests
+    )
     plan = BlockTransferPlan("async-load", 1, request_id="req")
     worker.start_load_kv(
         None,
@@ -1793,7 +1897,9 @@ def test_worker_polls_async_load_without_forward_execution(fail_load):
     assert worker.get_finished(set()) == (None, {"req"})
     assert worker.get_failed_recving() == ({"req"} if fail_load else set())
     assert worker.get_failed_recving() == set()
-    assert worker.get_block_ids_with_load_errors() == ({1} if fail_load else set())
+    assert worker.get_block_ids_with_load_errors() == (
+        {1} if fail_load and not report_failed_requests else set()
+    )
 
 
 class _CancellableWorkerHandle(_WorkerHandle):
@@ -2839,7 +2945,7 @@ def test_hybrid_fine_hash_lookup_is_not_limited_by_gpu_page_count():
         block_hashes=[bytes([index]) for index in range(32)],
     )
     for _ in range(2):
-        assert scheduler.get_num_new_matched_tokens(request, 0) == (124, False)
+        assert scheduler.get_num_new_matched_tokens(request, 0) == (124, True)
     scheduler.close()
 
 
@@ -3021,3 +3127,137 @@ def test_worker_submits_stores_once(grouped, layerwise, layer_callbacks):
     completed = worker.build_connector_worker_meta()
     assert completed.store_events == {19: StoreEventResult(1)}
     assert worker.get_kv_connector_stats().reduce()["store_num_bytes"] == 32
+
+
+def test_uniform_group_namespace_matches_scheduler_and_layout_uses_layer_pages():
+    worker_config = _kv_cache_config()
+    group = worker_config.kv_cache_groups[0]
+    first = group.kv_cache_spec
+    second = replace(first, num_kv_heads=1)
+    group.kv_cache_spec = UniformTypeKVCacheSpecs(
+        block_size=16, kv_cache_specs={"layer1": first, "layer2": second}
+    )
+    scheduler_config = generate_scheduler_kv_cache_config([worker_config])
+    config = _vllm_config({})
+    assert UMBPNamespace.from_vllm_config(config, worker_config) == (
+        UMBPNamespace.from_vllm_config(config, scheduler_config)
+    )
+    planner = KVLayoutPlanner.from_kv_cache_config(worker_config)
+    assert [region.block_bytes for region in planner.regions] == [
+        first.page_size_bytes,
+        second.page_size_bytes,
+    ]
+    assert planner.object_size == first.page_size_bytes + second.page_size_bytes
+
+
+def test_restored_hybrid_store_residency_skips_live_state_groups():
+    config = _hybrid_kv_cache_config()
+    # Put state before attention to catch positional zipping after filtering.
+    config.kv_cache_groups.reverse()
+    scheduler = UMBPStoreConnectorScheduler(
+        _vllm_config({}),
+        config,
+        _SchedulerHandle([True]),
+        BlockIdentityCodec(UMBPNamespace("restore-state")),
+    )
+    request = SimpleNamespace(request_id="r", block_hashes=[b"a", b"b"])
+    tracker = RequestTracker(generation=0)
+    tracker.load_spec = LoadSpec(local_tokens=0, external_tokens=16)
+    assert scheduler._store_plans(request, tracker, 16, ([0], [7])) == []
+
+
+@pytest.mark.parametrize(
+    ("missing_group", "missing_rank"),
+    [(None, 0), *((group, rank) for group in range(3) for rank in range(4))],
+)
+def test_minimax_m3_eagle_lookup_requires_every_cache_on_every_rank(
+    missing_group, missing_rank
+):
+    """Target K/V alone cannot restore a sparse indexer or EAGLE3 prefix."""
+    from tests.v1.kv_connector.umbp_test_utils import minimax_m3_kv_cache_config
+
+    config = minimax_m3_kv_cache_config()
+    topology = RankTopology(tp_size=4)
+    codec = BlockIdentityCodec(UMBPNamespace("minimax-m3-eagle"))
+    hashes = [b"a", b"b", b"c", b"d"]
+    hits = dict.fromkeys(
+        [
+            key
+            for h in hashes
+            for key in codec.keys_for_topology(h, topology, (0, 1, 2))
+        ],
+        True,
+    )
+    if missing_group is not None:
+        hits[codec.key_for_namespace(b"a", missing_group, (missing_rank, 0, 0, 0))] = (
+            False
+        )
+    vllm_config = _vllm_config(
+        {"mode": "embedded", "load_async": False},
+        tensor_parallel_size=4,
+        world_size=4,
+    )
+    vllm_config.cache_config.block_size = 128
+    vllm_config.model_config.max_model_len = 1024
+    vllm_config.speculative_config = SimpleNamespace(use_eagle_block_drop=lambda: True)
+    scheduler = UMBPStoreConnectorScheduler(
+        vllm_config,
+        config,
+        _SchedulerHandle(hits),
+        codec,
+        topology,
+    )
+    try:
+        result = scheduler.get_num_new_matched_tokens(
+            SimpleNamespace(request_id="r", block_hashes=hashes, num_tokens=513),
+            0,
+        )
+        assert result == ((384, True) if missing_group is None else (0, False))
+    finally:
+        scheduler.close()
+
+
+def test_minimax_scheduler_accepts_collapsed_mixed_page_specs(monkeypatch):
+    """Core's scheduler spec is representative, not each layer's physical page."""
+    from tests.v1.kv_connector.umbp_test_utils import (
+        install_memory_runtime,
+        minimax_m3_kv_cache_config,
+    )
+
+    runtime = install_memory_runtime(monkeypatch)
+    monkeypatch.setattr(
+        runtime, "create_scheduler_handle", lambda *_: _SchedulerHandle([True] * 3)
+    )
+    config = minimax_m3_kv_cache_config()
+    specs = {
+        group.layer_names[0]: group.kv_cache_spec for group in config.kv_cache_groups
+    }
+    config.kv_cache_groups = [
+        KVCacheGroupSpec(
+            list(specs),
+            UniformTypeKVCacheSpecs(block_size=128, kv_cache_specs=specs),
+        )
+    ]
+    for tensor in config.kv_cache_tensors:
+        page_bytes = specs[tensor.layers[0]].page_size_bytes
+        tensor.size = tensor.layer_stride = config.num_blocks * page_bytes
+        tensor.block_stride = page_bytes
+        tensor.offset = 0
+    scheduler_config = generate_scheduler_kv_cache_config([config])
+    vllm_config = _vllm_config({"mode": "embedded", "load_async": False})
+    vllm_config.speculative_config = SimpleNamespace(use_eagle_block_drop=lambda: True)
+    vllm_config.cache_config.block_size = 128
+    connector = UMBPStoreConnector(
+        vllm_config, KVConnectorRole.SCHEDULER, scheduler_config
+    )
+    try:
+        assert connector.get_num_new_matched_tokens(
+            SimpleNamespace(
+                request_id="mixed-pages",
+                block_hashes=[b"a", b"b", b"c"],
+                num_tokens=385,
+            ),
+            0,
+        ) == (256, True)
+    finally:
+        connector.connector_scheduler.close()

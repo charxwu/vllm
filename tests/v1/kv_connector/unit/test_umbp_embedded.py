@@ -337,6 +337,24 @@ def test_embedded_connector_rejects_pipeline_parallelism():
         )
 
 
+@pytest.mark.parametrize("role", [KVConnectorRole.SCHEDULER, KVConnectorRole.WORKER])
+@pytest.mark.parametrize("excluded_by", ["spec", "transfer"])
+def test_connector_rejects_eagle_draft_cache_omitted_from_prefix_restore(
+    role, excluded_by
+):
+    """Target-only restore must not silently leave draft KV uninitialized."""
+    from tests.v1.kv_connector.umbp_test_utils import minimax_m3_kv_cache_config
+
+    config = minimax_m3_kv_cache_config()
+    draft = config.kv_cache_groups[2]
+    if excluded_by == "spec":
+        draft.kv_cache_spec = SimpleNamespace(prefix_cacheable=False)
+    else:
+        draft.enable_kv_transfer = False
+    with pytest.raises(NotImplementedError, match="EAGLE draft cache group 2"):
+        UMBPStoreConnector(_vllm_config({"mode": "embedded"}), role, config)
+
+
 @pytest.mark.parametrize("close_rank", [None, 0, 1])
 def test_mori_scheduler_routes_lookup_and_clear_to_all_ranks(tmp_path, close_rank):
     _rank_namespace_from_key_prefix.cache_clear()
@@ -819,7 +837,7 @@ def test_mori_publication_does_not_flush_on_the_worker_thread(tmp_path, flush_su
         handle.close()
 
 
-def test_async_store_timeout_does_not_release_buffers():
+def test_async_transfer_timeout_does_not_release_buffers():
     handle = _MoriWorkerHandle(
         SimpleNamespace(close=lambda: None), "timeout", RankTopology(), "/tmp", 1, 1
     )
@@ -827,7 +845,7 @@ def test_async_store_timeout_does_not_release_buffers():
     job.start()
     future: Future[TransferJobState] = Future()
     handle._futures[id(job)] = future
-    handle._store_deadlines[id(job)] = 0
+    handle._transfer_deadlines[id(job)] = 0
     with pytest.raises(TimeoutError, match="buffers still in use"):
         handle.poll(job)
     assert job.status is TransferJobStatus.RUNNING
@@ -850,3 +868,97 @@ def test_mori_completed_transfer_timeout_is_a_safe_failure():
     assert handle.wait(job).status is TransferJobStatus.FAILED
     assert handle.poll(job) is job
     handle.close()
+
+
+@pytest.mark.parametrize("bulk", [False, True])
+def test_async_load_timeout_retains_worker_job_and_registered_buffers(
+    bulk_worker, monkeypatch, bulk
+):
+    worker, _buffers, _calls = bulk_worker
+    handle = worker.runtime
+    worker._report_failed_requests = True
+    started, release, close_started, close_done = (threading.Event() for _ in range(4))
+    deregistered = []
+
+    def blocked_load(keys, *args):
+        started.set()
+        assert release.wait(5)
+        return [True] * len(keys)
+
+    monkeypatch.setattr(handle.client, "batch_get_ranges_into_ptr", blocked_load)
+    monkeypatch.setattr(
+        handle.client, "deregister_memory", lambda ptr: deregistered.append(ptr)
+    )
+    if not bulk:
+        monkeypatch.setattr(handle, "load_blocks", lambda plans: None)
+    plans = [BlockTransferPlan("stalled", 1, group_id=0)]
+    worker.start_load_kv(
+        None, UMBPConnectorMetadata(async_load=True, load_requests={"r": plans})
+    )
+    assert started.wait(5)
+    job = worker._load_jobs["r"][None]
+    assert id(job) in handle._transfer_deadlines
+    handle._transfer_deadlines[id(job)] = 0
+
+    def close():
+        close_started.set()
+        handle.close()
+        close_done.set()
+
+    closer = threading.Thread(target=close)
+    try:
+        with pytest.raises(TimeoutError, match="buffers still in use"):
+            worker.get_finished(set())
+        assert worker._load_jobs["r"][None] is job
+        assert worker.get_failed_recving() == set()
+        assert not worker._finished_recving
+        assert job.status is TransferJobStatus.RUNNING
+        assert id(job) in handle._futures
+        handle._timeout_s = 0.001
+        with pytest.raises(TimeoutError, match="buffers still in use"):
+            handle.cancel(job)
+        closer.start()
+        assert close_started.wait(1)
+        assert not close_done.wait(0.05)
+        assert not deregistered
+    finally:
+        release.set()
+        if closer.ident is not None:
+            closer.join(5)
+    assert close_done.is_set()
+    assert deregistered
+    assert handle.poll(job).status is TransferJobStatus.COMPLETED
+
+
+@pytest.mark.parametrize("bulk", [False, True])
+def test_completed_native_timeout_reports_safe_request_failure(
+    bulk_worker, monkeypatch, bulk
+):
+    worker, _buffers, _calls = bulk_worker
+    handle = worker.runtime
+    worker._report_failed_requests = True
+
+    def failed_load(*args):
+        raise TimeoutError("native backend has returned")
+
+    monkeypatch.setattr(handle.client, "batch_get_ranges_into_ptr", failed_load)
+    if not bulk:
+        monkeypatch.setattr(handle, "load_blocks", lambda plans: None)
+    worker.start_load_kv(
+        None,
+        UMBPConnectorMetadata(
+            async_load=True,
+            load_requests={"r": [BlockTransferPlan("failed", 1, group_id=0)]},
+        ),
+    )
+    job = worker._load_jobs["r"][None]
+    future = handle._futures[id(job)]
+    with pytest.raises(TimeoutError, match="native backend has returned"):
+        future.result(timeout=5)
+    assert future.done()
+    assert worker.get_finished(set()) == (None, {"r"})
+    assert worker.get_failed_recving() == {"r"}
+    assert worker.get_failed_recving() == set()
+    assert "r" not in worker._load_jobs
+    assert id(job) not in handle._futures
+    assert job.status is TransferJobStatus.FAILED

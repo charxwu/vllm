@@ -35,6 +35,8 @@ from vllm.v1.kv_cache_interface import (
     KVCacheConfig,
     MambaSpec,
     SlidingWindowSpec,
+    SparseCacheRole,
+    iter_layer_specs,
 )
 from vllm.v1.outputs import KVConnectorOutput
 from vllm.v1.request import Request
@@ -43,7 +45,6 @@ from .data import (
     BlockIdentityCodec,
     BlockLoadBatch,
     BlockTransferPlan,
-    KVLayoutPlanner,
     LoadSpec,
     RankTopology,
     RequestTracker,
@@ -156,6 +157,14 @@ class UMBPStoreConnectorScheduler:
             * dcp_world_size_for_kv_cache_spec(group.kv_cache_spec, dcp_size)
             for group_id, group in enumerate(kv_cache_config.kv_cache_groups)
         }
+        # Align-mode state slots can be rewritten or relocated between steps.
+        # Only core's committed boundary hand-offs identify a safe snapshot.
+        self._boundary_handoff_groups = frozenset(
+            group_id
+            for group_id, group in enumerate(kv_cache_config.kv_cache_groups)
+            if isinstance(group.kv_cache_spec, MambaSpec)
+            and group.kv_cache_spec.mamba_cache_mode == "align"
+        )
         self.runtime = runtime
         self.layerwise_store = layerwise_store
         self.enable_kv_cache_events = bool(
@@ -163,12 +172,37 @@ class UMBPStoreConnectorScheduler:
             and vllm_config.kv_events_config.enable_kv_cache_events
         )
         self.codec = codec
-        self.layout = KVLayoutPlanner.from_kv_cache_config(kv_cache_config)
+        self.layer_groups = {
+            layer_name: group_id
+            for group_id, group in enumerate(kv_cache_config.kv_cache_groups)
+            if group.enable_kv_transfer
+            for layer_name in group.layer_names
+        }
         self.topology = topology or RankTopology()
         transfer_config = vllm_config.kv_transfer_config
         assert transfer_config is not None
         extra = transfer_config.kv_connector_extra_config
         self.load_async = bool(extra.get("load_async", True))
+        if not self.load_async and (
+            len(kv_cache_config.kv_cache_groups) > 1
+            or (
+                vllm_config.speculative_config is not None
+                and vllm_config.speculative_config.use_eagle_block_drop()
+            )
+            or any(
+                isinstance(spec, MambaSpec)
+                or getattr(spec, "cache_role", None) == SparseCacheRole.INDEXER
+                for group in kv_cache_config.kv_cache_groups
+                for spec in iter_layer_specs(group.kv_cache_spec)
+            )
+        ):
+            # State/indexer layers read their caches before attention's wait
+            # hook. Core also recovers multi-group failures at request level.
+            logger.warning(
+                "UMBP requires asynchronous loads for hybrid/state/draft caches; "
+                "load_async=false is ignored"
+            )
+            self.load_async = True
         self.enable_lookup = bool(extra.get("enable_lookup", True))
         self.lookup_async = bool(extra.get("lookup_async", False))
         self.save_decode_cache = bool(extra.get("save_decode_cache", False))
@@ -227,7 +261,7 @@ class UMBPStoreConnectorScheduler:
                 ),
                 allow_partial_hash_hits=self.enable_partial_hash_hits,
             )
-            if len(lookup_groups) > 1
+            if len(lookup_groups) > 1 or use_eagle
             else None
         )
         self._lookup_pool = _LookupBlockPool(self.hash_block_size)
@@ -509,7 +543,7 @@ class UMBPStoreConnectorScheduler:
         if not block_groups:
             return
         tracker = self._tracker_for_request(request.request_id)
-        tracker.update_blocks(tuple(list(group) for group in block_groups))
+        tracker.replace_blocks(tuple(list(group) for group in block_groups))
         if num_external_tokens <= 0:
             self._pending_loads.pop(request.request_id, None)
             self._load_specs.pop(request.request_id, None)
@@ -836,9 +870,9 @@ class UMBPStoreConnectorScheduler:
         """Expose layer ownership without changing bulk plan semantics."""
         for plan in meta.store_plans:
             layer_names = {item.layer_name for item in plan.ranges} or {
-                region.layer_name
-                for region in self.layout.regions
-                if plan.group_id is None or region.group_id == plan.group_id
+                layer_name
+                for layer_name, group_id in self.layer_groups.items()
+                if plan.group_id is None or group_id == plan.group_id
             }
             for layer_name in layer_names:
                 meta.store_plans_by_layer.setdefault(layer_name, []).append(plan)
@@ -958,6 +992,7 @@ class UMBPStoreConnectorScheduler:
                 min(save_to // self.group_block_sizes[group_id], len(block_ids)),
             )
             for group_id, block_ids in zip(group_ids, block_groups)
+            if group_id not in self._boundary_handoff_groups
         }
         resident_blocks = (
             self._restored_store_blocks(
@@ -967,6 +1002,8 @@ class UMBPStoreConnectorScheduler:
             else {}
         )
         for group_id, block_ids in zip(group_ids, block_groups):
+            if group_id not in block_ranges:
+                continue
             group_block_size = self.group_block_sizes[group_id]
             resident = resident_blocks.get(group_id, ())
             for index in block_ranges[group_id]:
@@ -1014,6 +1051,13 @@ class UMBPStoreConnectorScheduler:
         block_groups: tuple[list[int], ...],
     ) -> dict[int, set[int]]:
         """Query residency before constructing plans for restored blocks."""
+        blocks_by_group = dict(
+            zip(
+                self.kv_cache_config.prefix_cacheable_group_ids,
+                block_groups,
+                strict=True,
+            )
+        )
         candidates = {
             group_id: [
                 index
@@ -1024,11 +1068,9 @@ class UMBPStoreConnectorScheduler:
                         restored_tokens // self.group_block_sizes[group_id],
                     ),
                 )
-                if block_ids[index] != NULL_BLOCK_ID
+                if blocks_by_group[group_id][index] != NULL_BLOCK_ID
             ]
-            for (group_id, indices), block_ids in zip(
-                block_ranges.items(), block_groups, strict=True
-            )
+            for group_id, indices in block_ranges.items()
         }
         keys = [
             key

@@ -675,3 +675,37 @@ def test_deepseek_v4_sync_load_failure_fails_and_evicts_real_blocks():
     assert len(engine_outputs.outputs) == 1
     assert engine_outputs.outputs[0].request_id == request.request_id
     assert engine_outputs.outputs[0].finish_reason == FinishReason.ERROR
+
+
+def test_hybrid_completed_load_failure_retries_from_zero(hybrid_scheduler: Scheduler):
+    """Only a completed receive may release destinations and resume computation."""
+    request = _schedule_hybrid_async_load(hybrid_scheduler, 10, 9)
+    scheduled = hybrid_scheduler.schedule()
+    assert request.status == RequestStatus.WAITING_FOR_REMOTE_KVS
+    allocated = hybrid_scheduler.kv_cache_manager.get_block_ids(request.request_id)
+    # While the native transfer owns the destinations, no completion is sent.
+    hybrid_scheduler.update_from_output(
+        scheduled, create_model_runner_output(reqs=[], finished_recving=set())
+    )
+    idle = hybrid_scheduler.schedule()
+    assert idle.num_scheduled_tokens == {}
+    assert (
+        hybrid_scheduler.kv_cache_manager.get_block_ids(request.request_id) == allocated
+    )
+    assert request.status == RequestStatus.WAITING_FOR_REMOTE_KVS
+
+    # Once native I/O has returned, even a backend TimeoutError is a safe failure.
+    failed = create_model_runner_output(reqs=[], finished_recving={request.request_id})
+    assert failed.kv_connector_output is not None
+    failed.kv_connector_output.failed_recving = {request.request_id}
+    hybrid_scheduler.update_from_output(idle, failed)
+    assert request.num_computed_tokens == 0
+    assert hybrid_scheduler.failed_recving_kv_req_ids == {request.request_id}
+    hybrid_scheduler.connector.get_num_new_matched_tokens.side_effect = None
+    hybrid_scheduler.connector.get_num_new_matched_tokens.return_value = (0, False)
+    retry = hybrid_scheduler.schedule()
+    assert retry.num_scheduled_tokens[request.request_id] > 0
+    assert request.status == RequestStatus.RUNNING
+    assert not hybrid_scheduler.failed_recving_kv_req_ids
+    assert not hybrid_scheduler.finished_recving_kv_req_ids
+    assert request.num_computed_tokens == retry.num_scheduled_tokens[request.request_id]
