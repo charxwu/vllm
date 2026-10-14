@@ -35,6 +35,9 @@ engine container or with `--ipc=host` and the same device mounts.
 
 `UMBP_DRAM_*` variables control huge pages, NUMA placement, prefaulting, and
 eviction watermarks, as described in the MORI UMBP documentation.
+`UMBP_LOW_CLASS_AGE_WEIGHT` in the server's environment sets how much faster
+Mamba-style state checkpoints age than KV blocks; see
+[eviction hints](umbp_embedded_dram.md#eviction-hints).
 
 ## Connector configuration
 

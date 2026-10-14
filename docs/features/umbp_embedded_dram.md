@@ -54,13 +54,32 @@ never stores.
 | `save_decode_cache` | `false` | Also store blocks produced by decoding. |
 | `lazy_offload` | `false` | Store reusable blocks selected from the GPU free queue instead of storing them eagerly after each forward step. |
 | `lazy_offload_max_blocks` | derived | Maximum number of free-queue blocks examined by each lazy scan. |
-| `enable_partial_hash_hits` | `false` | Allow hits that end inside a block, at core's prefix-match unit (`cache_config.prefix_match_unit`). |
+| `enable_partial_hash_hits` | `false`; `true` for Mamba "align" hybrid models whose prefix-match unit is finer than the scheduler block | Allow hits that end inside a block, at core's prefix-match unit (`cache_config.prefix_match_unit`). A hybrid model's state checkpoints sit on prompt-tail hash boundaries, so block-granular lookup almost never hits. |
 | `num_workers`, `timeout_ms` | `4`, `30000` | Transfer threads per worker, and how long a worker waits for a transfer it must finish before failing the step rather than reusing its blocks. |
 | `lookup_instance` | | Distinguishes independent engines serving the same model on one host. Data-parallel ranks are already distinguished. |
 | `lookup_dir` | `/tmp` | Directory of the per-worker lookup sockets. |
 | `key_namespace` | derived | Overrides the namespace derived from the model, revision, KV layout, cache groups, parallel topology and draft model. |
 | `dram_high_watermark`, `dram_low_watermark` | MORI defaults | Pool occupancy at which eviction starts and stops. |
 | `dram_use_hugepages`, `dram_hugepage_size`, `dram_numa_node`, `dram_prefault` | MORI defaults | Allocation of each worker's pool. |
+
+## Eviction hints
+
+Each pool evicts least recently used objects once it crosses its high
+watermark. Two hints keep that order useful when the GPU cache sits in front
+of it:
+
+- When a request hits its prefix in the GPU cache, the connector marks the
+  pool's copies of the blocks and state checkpoint behind the hit as recently
+  used. Without this, the hottest prefixes, which are never read back from the
+  pool, would age from their first store and be evicted first.
+- Objects of Mamba-style groups, which are stored for every prompt but rarely
+  read back, are put in a low-priority class. When the pool picks between its
+  oldest normal and oldest low-priority object, the latter's age counts
+  `UMBP_LOW_CLASS_AGE_WEIGHT` times (set in the engine's environment; default
+  `1`, one plain LRU order).
+
+Both need a MORI build with `BatchTouch` and `BatchSetEvictionClass`; with an
+older build they are skipped.
 
 ## Limitations
 
