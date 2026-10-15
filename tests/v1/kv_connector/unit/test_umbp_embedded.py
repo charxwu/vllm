@@ -259,6 +259,18 @@ def test_embedded_runtime_maps_dram_options_to_mori_config():
     }
 
 
+def test_embedded_runtime_defaults_watermarks_only_when_neither_is_set():
+    unset = SimpleNamespace(dram=SimpleNamespace())
+    _configure_dram(unset, {"capacity_bytes": 1024})
+    assert (unset.dram.high_watermark, unset.dram.low_watermark) == (0.99, 0.97)
+
+    # Setting one keeps MORI's default for the other.
+    one = SimpleNamespace(dram=SimpleNamespace())
+    _configure_dram(one, {"capacity_bytes": 1024, "dram_high_watermark": 0.95})
+    assert one.dram.high_watermark == 0.95
+    assert not hasattr(one.dram, "low_watermark")
+
+
 def test_embedded_rejects_test_only_backend():
     """Retired test configuration must not silently select the MORI backend."""
     with pytest.raises(ValueError, match="test-only"):
