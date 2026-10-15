@@ -59,7 +59,7 @@ never stores.
 | `lookup_instance` | | Distinguishes independent engines serving the same model on one host. Data-parallel ranks are already distinguished. |
 | `lookup_dir` | `/tmp` | Directory of the per-worker lookup sockets. |
 | `key_namespace` | derived | Overrides the namespace derived from the model, revision, KV layout, cache groups, parallel topology and draft model. |
-| `dram_high_watermark`, `dram_low_watermark` | MORI defaults | Pool occupancy at which eviction starts and stops. |
+| `dram_high_watermark`, `dram_low_watermark` | `0.99`, `0.97` | Pool occupancy at which eviction starts and stops. MORI's own defaults (`0.9`, `0.7`) keep the pool about 80% full; setting either option keeps MORI's default for the other. |
 | `dram_use_hugepages`, `dram_hugepage_size`, `dram_numa_node`, `dram_prefault` | MORI defaults | Allocation of each worker's pool. |
 
 ## Eviction hints
